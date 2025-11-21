@@ -1,11 +1,9 @@
-# moderation_service.py (Phiên bản FIX lỗi ModuleNotFoundError)
-
 import os
 from fastapi import FastAPI, UploadFile, File, HTTPException, status
 from dotenv import load_dotenv
 from clarifai.client.model import Model
-# 🚨 ĐÃ SỬA: Import ClarifaiException theo cách mới trong SDK 11.x
-from clarifai.errors import ApiError as ClarifaiException
+# Sửa lỗi: Import ApiError và đặt bí danh (alias)
+from clarifai.errors import ApiError as ClarifaiException 
 
 
 # Load biến môi trường
@@ -17,35 +15,41 @@ app = FastAPI(
 )
 
 # --- Cấu hình Clarifai ---
-CLARIFI_API_KEY = os.getenv("CLARIFAI_API_KEY")
+# CHUẨN HÓA TÊN BIẾN: Sử dụng CLARIFAI_API_KEY (có chữ 'A' rõ ràng)
+CLARIFAI_API_KEY = os.getenv("CLARIFAI_API_KEY") 
 MODEL_URL = "https://clarifai.com/clarifai/main/models/moderation-recognition"
-UNSAFE_THRESHOLD = 0.8  # Ngưỡng an toàn (80%)
-
+UNSAFE_THRESHOLD = 0.8
 BLOCKING_LABELS = ['suggestive', 'gore', 'drugs', 'hate', 'unsafe'] 
 
 clarifai_model = None
 
 # Khởi tạo Clarifai Model Client
+# Logic này được thiết kế để không crash server khi khởi động nếu key bị lỗi
 try:
-    if not CLARIFI_API_KEY:
-        # Kiểm tra API Key (có thể bỏ qua nếu bạn dùng PAT)
-        raise ValueError("CLARIFI_API_KEY chưa được thiết lập.")
-    
-    clarifai_model = Model(MODEL_URL, pat=CLARIFI_API_KEY)
-    print("✅ Clarifai Model Client đã được khởi tạo thành công.")
+    if not CLARIFAI_API_KEY:
+        # Nếu key thiếu, Model sẽ là None, và endpoint sẽ trả về 503
+        print("❌ Cảnh báo: CLARIFAI_API_KEY chưa được thiết lập. Service sẽ trả về 503.")
+    else:
+        # Khởi tạo Model bằng PAT
+        clarifai_model = Model(MODEL_URL, pat=CLARIFAI_API_KEY)
+        print("✅ Clarifai Model Client đã được khởi tạo thành công.")
     
 except Exception as e:
-    print(f"❌ Lỗi khi khởi tạo Clarifai: {e}")
-    pass
-
+    # Bắt lỗi nếu Model khởi tạo thất bại (ví dụ: key hết hạn hoặc lỗi kết nối)
+    print(f"❌ Lỗi nghiêm trọng khi khởi tạo Clarifai Model: {e}")
+    clarifai_model = None # Đặt lại Model là None để kích hoạt lỗi 503
 
 # --- Endpoint Kiểm duyệt Hình ảnh ---
 @app.post("/api/v1/image/moderation")
 async def check_image_moderation(image: UploadFile = File(...)):
+    # 1. Kiểm tra trạng thái Model: Trả về 503 nếu không khởi tạo được
     if not clarifai_model:
-        return {"is_unsafe": False, "message": "Moderation service is inactive or failed to initialize."}
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Moderation service is inactive. CLARIFAI_API_KEY may be missing or invalid."
+        )
 
-    # Đọc dữ liệu ảnh thành bytes
+    # 2. Đọc dữ liệu ảnh
     try:
         image_bytes = await image.read()
     except Exception as e:
@@ -54,26 +58,28 @@ async def check_image_moderation(image: UploadFile = File(...)):
             detail=f"Không thể đọc file: {e}"
         )
 
-    # 1. GỌI VÀ BẮT LỖI CLARIFAI
+    # 3. GỌI VÀ BẮT LỖI CLARIFI
     try:
         response = clarifai_model.predict_by_bytes(
             image_bytes, 
             input_type="image"
         )
     except ClarifaiException as e:
-        # Bắt lỗi cụ thể từ Clarifai API
-        print(f"Lỗi Clarifai API: {e}")
-        return {"is_unsafe": False, "message": f"API check failed due to Clarifai error: {e}"}
+        print(f"Lỗi Clarifai API (502): {e}")
+        # Trả về 502 Bad Gateway vì upstream API (Clarifai) bị lỗi
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY, 
+            detail=f"Lỗi trong quá trình gọi Clarifai API: {e}"
+        )
     except Exception as e:
-        # Bắt lỗi network hoặc I/O khác trong quá trình gọi API
         print(f"Lỗi gọi API: {e}")
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Lỗi trong quá trình gọi Clarifai API: {e}"
+            detail=f"Lỗi máy chủ nội bộ không xác định: {e}"
         )
         
 
-    # 2. XỬ LÝ KẾT QUẢ VÀ RAISE HTTP 403
+    # 4. XỬ LÝ KẾT QUẢ VÀ RAISE HTTP 403
     
     if not response.outputs or not response.outputs[0].data.concepts:
         print("Phản hồi Clarifai không hợp lệ hoặc không có kết quả.")
@@ -98,7 +104,6 @@ async def check_image_moderation(image: UploadFile = File(...)):
                 is_unsafe = True
 
     if is_unsafe:
-        # FastAPI tự xử lý HTTPException này, không cần except
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail={
